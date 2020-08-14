@@ -1,0 +1,109 @@
+// 发送消息时，根据注册信息自动填充消息ID字段，这样虽然比较方便，但是每种消息ID和消息类型一一对应，每个消息类型只能有一种用途。
+// 例如，消息类型 UserId，可表示上线的UserId，也可以表示下线的userid，这时我们用消息id表示UserId究竟代表上线还是下线。就需要多个消息Id对应一个消息类型。
+// 此时应该在发送消息时手动指明该消息的用途。
+
+
+
+
+
+#ifndef MSG_DISPATCHER_H_
+#define MSG_DISPATCHER_H_
+#include "muduo/net/Buffer.h"
+#include "muduo/net/TcpConnection.h"
+#include <google/protobuf/message.h>
+
+
+
+
+
+//////////////////////////////以下内容摘自muduo，为了实现不同的msg回调函数的注册////////////////////////////
+typedef std::shared_ptr<google::protobuf::Message> MessagePtr;
+typedef std::function<void(const muduo::net::TcpConnectionPtr &,
+                           const MessagePtr &message,
+                           muduo::Timestamp)>
+    ProtobufMessageCallback;
+
+class Callback : muduo::noncopyable
+{
+public:
+    virtual ~Callback() = default;
+    virtual void onMessage(const muduo::net::TcpConnectionPtr &,
+                           const MessagePtr &message,
+                           muduo::Timestamp) const = 0;
+};
+
+template <typename T>
+class CallbackT : public Callback
+{
+    static_assert(std::is_base_of<google::protobuf::Message, T>::value,
+                  "T must be derived from gpb::Message.");
+
+public:
+    typedef std::function<void(const muduo::net::TcpConnectionPtr &,
+                               const std::shared_ptr<T> &message,
+                               muduo::Timestamp)>
+        ProtobufMessageTCallback;
+
+    CallbackT(const ProtobufMessageTCallback &callback)
+        : callback_(callback)
+    {
+    }
+
+    void onMessage(const muduo::net::TcpConnectionPtr &conn,
+                   const MessagePtr &message,
+                   muduo::Timestamp receiveTime) const override
+    {
+        std::shared_ptr<T> concrete = muduo::down_pointer_cast<T>(message);
+        assert(concrete != NULL);
+        callback_(conn, concrete, receiveTime);
+    }
+
+private:
+    ProtobufMessageTCallback callback_;
+};
+
+////////////////////////////////////////////////////////////////////////////////////
+
+class MsgDispatcher
+{
+public:
+    explicit MsgDispatcher(ProtobufMessageCallback default_cb);
+    ~MsgDispatcher();
+
+    void onBufferMessage(const muduo::net::TcpConnectionPtr &conn,
+                         muduo::net::Buffer *buff,
+                         muduo::Timestamp reveiveTime);
+
+    void send(const muduo::net::TcpConnectionPtr &conn,
+              const google::protobuf::Message &message)
+    {
+        // FIXME: serialize to TcpConnection::outputBuffer()
+        muduo::net::Buffer buf;
+        fillEmptyBuffer(&buf, message);
+        conn->send(&buf);
+    }
+
+    template <typename T>
+    void registMsg(uint32_t msgid, const std::string &name, const typename CallbackT<T>::ProtobufMessageTCallback cbk = NULL)
+    {
+        if(cbk)// 无回调函数不注册
+        {
+            std::shared_ptr<CallbackT<T>> pd(new CallbackT<T>(callback));
+            callbacks_[msgid] = pd;
+        }    
+        id2namemap_[msgid] = name;
+        name2idmap_[name] = msgtype;
+    }
+    static google::protobuf::Message *createMessage(const std::string &type_name);
+    void fillEmptyBuffer(muduo::net::Buffer* buf, const google::protobuf::Message& message);
+    
+private:
+    typedef std::map<uint32_t, std::shared_ptr<Callback>> CallbackMap;
+
+    CallbackMap callbacks_;
+    std::unordered_map<uint32_t, std::string> id2namemap_;
+    std::unordered_map<std::string, uint32_t> name2idmap_;
+    ProtobufMessageCallback defaultCallback_;
+};
+
+#endif
